@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.2.0] - 2026-04-21
+
 ### Removed
 
 - **Batching (`SendMessageBatch`) removed from sender.** The blocking-submit design
