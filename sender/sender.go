@@ -54,17 +54,9 @@ type SQSSender struct {
 	delaySeconds   int32
 	topicAttribute string
 	fifo           *FIFOConfig
-	batcher        *Batcher
 	metrics        *SenderMetrics
 	logger         *zap.Logger
 	tracerProvider trace.TracerProvider
-}
-
-// SQSBatchSendAPI combines single and batch send APIs. Implementations
-// of the real SQS client satisfy both.
-type SQSBatchSendAPI interface {
-	SQSSendAPI
-	SQSBatchAPI
 }
 
 // SQSSendAPI is the subset of the SQS client API used by the sender.
@@ -81,20 +73,11 @@ func (s *SQSSender) tracer() trace.Tracer {
 	return tp.Tracer("github.com/tsarna/vinculum-sqs/sender")
 }
 
-// Start starts the batcher if batching is enabled. No-op otherwise.
-func (s *SQSSender) Start() {
-	if s.batcher != nil {
-		s.batcher.Start()
-	}
-}
+// Start is a no-op. Reserved for future use.
+func (s *SQSSender) Start() {}
 
-// Stop stops the batcher if batching is enabled, flushing remaining messages.
-// No-op otherwise.
-func (s *SQSSender) Stop() {
-	if s.batcher != nil {
-		s.batcher.Stop()
-	}
-}
+// Stop is a no-op. Reserved for future use.
+func (s *SQSSender) Stop() {}
 
 // OnEvent serializes the message, maps fields to SQS message attributes,
 // and sends the message to the configured SQS queue.
@@ -155,29 +138,6 @@ func (s *SQSSender) OnEvent(ctx context.Context, topic string, msg any, fields m
 		}
 	}
 
-	// Batched path.
-	if s.batcher != nil {
-		entry := sqstypes.SendMessageBatchRequestEntry{
-			MessageBody:            &body,
-			MessageAttributes:      attrs,
-			MessageGroupId:         messageGroupID,
-			MessageDeduplicationId: messageDeduplicationID,
-		}
-		if s.delaySeconds > 0 {
-			entry.DelaySeconds = s.delaySeconds
-		}
-
-		if err := s.batcher.Submit(ctx, entry); err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
-			return fmt.Errorf("sqs sender %s: batch send: %w", s.queueName, err)
-		}
-		s.metrics.RecordSent(ctx)
-		s.metrics.RecordOperationDuration(ctx, time.Since(start))
-		return nil
-	}
-
-	// Single-message path.
 	input := &sqs.SendMessageInput{
 		QueueUrl:               &s.queueURL,
 		MessageBody:            &body,

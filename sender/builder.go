@@ -18,7 +18,6 @@ type SenderBuilder struct {
 	delaySeconds   int32
 	topicAttribute string
 	fifo           *FIFOConfig
-	batchConfig    *BatchConfig
 	meterProvider  metric.MeterProvider
 	logger         *zap.Logger
 	tracerProvider trace.TracerProvider
@@ -78,11 +77,6 @@ func (b *SenderBuilder) WithFIFOConfig(cfg *FIFOConfig) *SenderBuilder {
 	return b
 }
 
-func (b *SenderBuilder) WithBatchConfig(cfg *BatchConfig) *SenderBuilder {
-	b.batchConfig = cfg
-	return b
-}
-
 func (b *SenderBuilder) WithMeterProvider(mp metric.MeterProvider) *SenderBuilder {
 	b.meterProvider = mp
 	return b
@@ -107,16 +101,6 @@ func (b *SenderBuilder) Build() (*SQSSender, error) {
 		return nil, errors.New("sqs sender: FIFO queue requires message_group_id (queue URL ends in .fifo)")
 	}
 
-	// Batching requires the client to also implement SQSBatchAPI.
-	var batcher *Batcher
-	if b.batchConfig != nil {
-		batchClient, ok := b.client.(SQSBatchAPI)
-		if !ok {
-			return nil, errors.New("sqs sender: batching requires a client that supports SendMessageBatch")
-		}
-		batcher = NewBatcher(batchClient, b.queueURL, *b.batchConfig, b.logger)
-	}
-
 	queueName := queueNameFromURL(b.queueURL)
 
 	return &SQSSender{
@@ -127,7 +111,6 @@ func (b *SenderBuilder) Build() (*SQSSender, error) {
 		delaySeconds:   b.delaySeconds,
 		topicAttribute: b.topicAttribute,
 		fifo:           b.fifo,
-		batcher:        batcher,
 		metrics:        NewSenderMetrics(b.clientName, queueName, b.meterProvider),
 		logger:         b.logger,
 		tracerProvider: b.tracerProvider,

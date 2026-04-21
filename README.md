@@ -18,9 +18,8 @@ Implements `bus.Subscriber`. `OnEvent` serializes the payload, maps vinculum fie
 - Optional `topic_attribute` to include the vinculum topic as a message attribute
 - SQS attribute name validation and 10-attribute budget enforcement
 - FIFO queue support: per-message `MessageGroupId` and `MessageDeduplicationId` via configurable functions
-- Batching via `SendMessageBatch` with configurable max size (1--10) and max delay
 - W3C trace context propagation (inject into message attributes)
-- OTel metrics instrumentation (sent count, operation duration, batch size)
+- OTel metrics instrumentation (sent count, operation duration)
 
 **Builder example:**
 
@@ -36,13 +35,9 @@ sender, err := sender.NewSender().
             return topic, nil
         },
     }).
-    WithBatchConfig(&sender.BatchConfig{MaxSize: 10, MaxDelay: 100 * time.Millisecond}).
     WithMeterProvider(mp).
     WithLogger(logger).
     Build()
-
-sender.Start() // starts batcher goroutine (no-op if batching disabled)
-defer sender.Stop()
 ```
 
 ### `receiver` -- SQSReceiver
@@ -95,8 +90,7 @@ Both packages expose instrumentation via an OTel `metric.MeterProvider`. Pass `n
 | Metric | Type | Unit | Description |
 |--------|------|------|-------------|
 | `messaging.client.sent.messages` | Int64Counter | `{message}` | Messages sent |
-| `messaging.client.operation.duration` | Float64Histogram | `s` | SendMessage / SendMessageBatch latency |
-| `messaging.batch.message_count` | Float64Histogram | `{message}` | Messages per batch (when batching enabled) |
+| `messaging.client.operation.duration` | Float64Histogram | `s` | SendMessage latency |
 
 ### Receiver metrics
 
@@ -124,12 +118,6 @@ client "sqs_sender" "orders" {
     aws             = client.prod
     queue_url       = "https://sqs.us-east-1.amazonaws.com/123456789012/orders"
     topic_attribute = "source_topic"
-
-    batch {
-        enabled   = true
-        max_size  = 10
-        max_delay = "100ms"
-    }
 }
 
 subscription "to_sqs" {
