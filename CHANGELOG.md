@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [0.2.0] - 2026-05-27
+
+### Changed
+
+- Changed license to Apache-2.0
+
 ## [0.2.0] - 2026-04-21
 
 ### Removed
