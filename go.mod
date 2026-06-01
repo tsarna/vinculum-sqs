@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.9
-	github.com/aws/aws-sdk-go-v2/service/sqs v1.42.27
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.42.29
 	github.com/stretchr/testify v1.11.1
 	github.com/tsarna/vinculum-bus v0.15.0
 	github.com/tsarna/vinculum-wire v0.2.0
@@ -18,8 +18,8 @@ require (
 require (
 	github.com/amir-yaghoubi/mqttpattern v0.0.0-20250829083210-f7d8d46a786e // indirect
 	github.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.23 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.23 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.25 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.25 // indirect
 	github.com/aws/smithy-go v1.26.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
