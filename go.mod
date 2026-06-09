@@ -3,7 +3,7 @@ module github.com/tsarna/vinculum-sqs
 go 1.25.8
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.41.12
+	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.43.2
 	github.com/stretchr/testify v1.11.1
 	github.com/tsarna/vinculum-bus v0.15.0
