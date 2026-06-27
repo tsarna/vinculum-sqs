@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Inbound baggage now reaches `subscriber.OnEvent`.** The receiver extracted
+  W3C baggage from SQS message attributes but only used it to link the producer
+  span; the baggage was not carried onto the context passed to `OnEvent`, so
+  consumers could not read it. It is now copied onto the processing context
+  (the consumer span remains a new root linked to the producer — only baggage
+  rides along, not the span parent).
+
 ## [0.2.0] - 2026-05-27
 
 ### Changed

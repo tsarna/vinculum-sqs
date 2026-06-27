@@ -17,6 +17,7 @@ import (
 	wire "github.com/tsarna/vinculum-wire"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
@@ -188,6 +189,14 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message) 
 	propagator := otel.GetTextMapPropagator()
 	carrier := &vsqs.MessageAttributeCarrier{Attrs: msg.MessageAttributes}
 	producerCtx := propagator.Extract(ctx, carrier)
+
+	// Carry the producer's baggage onto the processing context so it reaches
+	// subscriber.OnEvent and action expressions. The consumer span below stays a
+	// new root linked to the producer span — only baggage rides along, not the
+	// span parent.
+	if bg := baggage.FromContext(producerCtx); bg.Len() > 0 {
+		ctx = baggage.ContextWithBaggage(ctx, bg)
+	}
 
 	// Start processing span as a new root linked to the producer span.
 	// SQS is async — the consumer process isn't part of the producer's

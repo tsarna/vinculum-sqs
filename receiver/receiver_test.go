@@ -15,13 +15,16 @@ import (
 	"github.com/stretchr/testify/require"
 	bus "github.com/tsarna/vinculum-bus"
 	wire "github.com/tsarna/vinculum-wire"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // mockSQSReceive implements SQSReceiveAPI for testing.
 type mockSQSReceive struct {
-	receiveFunc    func(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
-	deleteFunc     func(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
-	changeVisFunc  func(ctx context.Context, params *sqs.ChangeMessageVisibilityInput, optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
+	receiveFunc   func(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
+	deleteFunc    func(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
+	changeVisFunc func(ctx context.Context, params *sqs.ChangeMessageVisibilityInput, optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
 }
 
 func (m *mockSQSReceive) ReceiveMessage(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
@@ -54,15 +57,16 @@ type mockSubscriber struct {
 }
 
 type capturedEvent struct {
+	Ctx     context.Context
 	Topic   string
 	Message any
 	Fields  map[string]string
 }
 
-func (s *mockSubscriber) OnEvent(_ context.Context, topic string, msg any, fields map[string]string) error {
+func (s *mockSubscriber) OnEvent(ctx context.Context, topic string, msg any, fields map[string]string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.events = append(s.events, capturedEvent{Topic: topic, Message: msg, Fields: fields})
+	s.events = append(s.events, capturedEvent{Ctx: ctx, Topic: topic, Message: msg, Fields: fields})
 	return s.err
 }
 
@@ -109,6 +113,44 @@ func TestProcessMessage_BasicDispatch(t *testing.T) {
 	assert.Equal(t, "msg-123", events[0].Fields["$message_id"])
 	assert.Equal(t, "receipt-abc", events[0].Fields["$receipt_handle"])
 	assert.True(t, deleted.Load(), "message should be auto-deleted")
+}
+
+func TestProcessMessage_CarriesInboundBaggage(t *testing.T) {
+	prev := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, propagation.Baggage{}))
+	t.Cleanup(func() { otel.SetTextMapPropagator(prev) })
+
+	sub := &mockSubscriber{}
+	r, err := NewReceiver().
+		WithClient(&mockSQSReceive{}).
+		WithQueueURL("https://sqs.us-east-1.amazonaws.com/123456789012/test-queue").
+		WithSubscriber(sub).
+		Build()
+	require.NoError(t, err)
+
+	body := `"hello"`
+	receipt := "receipt-abc"
+	msg := sqstypes.Message{
+		Body:          &body,
+		ReceiptHandle: &receipt,
+		MessageAttributes: map[string]sqstypes.MessageAttributeValue{
+			"baggage": {
+				DataType:    aws.String("String"),
+				StringValue: aws.String("tenant_id=acme,secret=x"),
+			},
+		},
+	}
+
+	r.processMessage(context.Background(), msg)
+
+	events := sub.getEvents()
+	require.Len(t, events, 1)
+	// The producer's baggage must reach the OnEvent context (it previously did
+	// not — only the trace span was linked).
+	bg := baggage.FromContext(events[0].Ctx)
+	assert.Equal(t, "acme", bg.Member("tenant_id").Value())
+	assert.Equal(t, "x", bg.Member("secret").Value())
 }
 
 func TestProcessMessage_NoDeleteOnError(t *testing.T) {
@@ -217,9 +259,9 @@ func TestExtractFields_SystemAttributes(t *testing.T) {
 			"ApproximateReceiveCount":          "3",
 			"SentTimestamp":                    "1618870000000",
 			"ApproximateFirstReceiveTimestamp": "1618870001000",
-			"MessageGroupId":                  "group-1",
+			"MessageGroupId":                   "group-1",
 			"MessageDeduplicationId":           "dedup-1",
-			"SequenceNumber":                  "12345",
+			"SequenceNumber":                   "12345",
 		},
 	}
 
