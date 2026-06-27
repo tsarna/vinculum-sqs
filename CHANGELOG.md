@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.3.1] - 2026-06-27
+
 ### Fixed
 
 - **Inbound baggage now reaches `subscriber.OnEvent`.** The receiver extracted
@@ -11,7 +13,7 @@
   (the consumer span remains a new root linked to the producer — only baggage
   rides along, not the span parent).
 
-## [0.2.0] - 2026-05-27
+## [0.3.0] - 2026-05-27
 
 ### Changed
 
