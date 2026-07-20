@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+## [0.4.0] - 2026-07-20
+
+### Changed
+
+- **BREAKING: deserialize failures are no longer swallowed.** `SQSReceiver.processMessage`
+  used to log a warning and pass the **raw body string** through as the message payload
+  when the configured wire format failed to decode. That happened even when the caller
+  explicitly configured `wire.JSON`, so there was no way to say "messages on this queue
+  must be JSON". A decode failure is now fatal to the message: it never reaches
+  `subscriber.OnEvent`, and the message is not deleted.
+
+  **Attach an SQS redrive policy.** Because the message is not deleted it becomes visible
+  again after the visibility timeout and is redelivered indefinitely. A
+  [redrive policy](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html)
+  moves a persistently malformed message to a dead-letter queue after
+  `maxReceiveCount` attempts. This library cannot see the queue's redrive policy, so it
+  cannot warn you when one is missing.
+
+  Callers wanting best-effort decoding should use `wire.Auto`, which never fails (it yields
+  a `string` for anything it can't parse as JSON) — which for this receiver is close to the
+  old behavior, since the old fallback was also a string.
+
+- Requires `github.com/tsarna/vinculum-wire` v0.3.0 for the `DecodeError` /
+  `DecodeErrorHook` types.
+
+### Added
+
+- `WithDecodeErrorHook(wire.DecodeErrorHook)` on the receiver builder. The hook observes a
+  decode failure — it receives the raw body, the error, the format name, the extracted
+  fields, and the queue name and message ID — but cannot suppress it: the message is left
+  undeleted either way. nil (the default) means no observer.
+
+- A `vinculum.messaging.errors` counter, with `messaging.operation.name` and `error.type`
+  attributes. The receiver previously had no error instrument at all. Besides deserialize
+  failures (`error.type = "deserialize"`), it also covers the subscriber-failure and
+  DeleteMessage-failure paths, which were silent before.
+
 ## [0.3.1] - 2026-06-27
 
 ### Fixed

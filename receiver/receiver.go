@@ -49,6 +49,7 @@ type SQSReceiver struct {
 	queueName      string
 	subscriber     bus.Subscriber
 	wireFormat     wire.WireFormat
+	onDecodeError  wire.DecodeErrorHook
 	waitTime       int32
 	maxMessages    int32
 	visTimeout     *int32
@@ -220,17 +221,41 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message) 
 		span.SetAttributes(attribute.String("messaging.message.id", *msg.MessageId))
 	}
 
-	// Deserialize body.
+	// Deserialize body. A decode failure is fatal to the message: the
+	// configured wire format is a contract, so a body that doesn't satisfy
+	// it is not delivered. Use wire format "auto" for best-effort decoding.
+	//
+	// The message is NOT deleted, so it returns after the visibility
+	// timeout. Configure an SQS redrive policy so a persistently malformed
+	// message eventually lands in a dead-letter queue instead of cycling.
 	var payload any
 	if msg.Body != nil {
 		var err error
 		payload, err = r.wireFormat.Deserialize([]byte(*msg.Body))
 		if err != nil {
-			r.logger.Warn("sqs receiver: deserialize failed, passing raw string",
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "deserialize")
+			r.logger.Error("sqs receiver: deserialize failed",
 				zap.String("queue", r.queueName),
+				zap.String("wire_format", r.wireFormat.Name()),
 				zap.Error(err),
 			)
-			payload = *msg.Body
+			r.metrics.RecordError(ctx, "process", "deserialize")
+			if r.onDecodeError != nil {
+				attrs := map[string]string{"queue": r.queueName}
+				if msg.MessageId != nil {
+					attrs["message_id"] = *msg.MessageId
+				}
+				r.onDecodeError(ctx, wire.DecodeError{
+					Raw:    []byte(*msg.Body),
+					Err:    err,
+					Format: r.wireFormat.Name(),
+					Topic:  r.queueName,
+					Fields: fields,
+					Attrs:  attrs,
+				})
+			}
+			return
 		}
 	}
 
@@ -247,6 +272,7 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message) 
 			zap.String("topic", topic),
 			zap.Error(err),
 		)
+		r.metrics.RecordError(ctx, "process", "subscriber")
 		// Do NOT delete — message returns to queue after visibility timeout.
 		return
 	}
@@ -265,6 +291,7 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message) 
 				zap.String("queue", r.queueName),
 				zap.Error(err),
 			)
+			r.metrics.RecordError(ctx, "settle", "delete")
 			// Message will be redelivered after visibility timeout — at-least-once.
 		}
 	}

@@ -14,6 +14,7 @@ import (
 type ReceiverMetrics struct {
 	messagesConsumed metric.Int64Counter
 	processDuration  metric.Float64Histogram
+	errors           metric.Int64Counter
 	baseAttrs        metric.MeasurementOption
 }
 
@@ -33,9 +34,14 @@ func NewReceiverMetrics(clientName, queueName string, mp metric.MeterProvider) *
 		metric.WithUnit("s"),
 		metric.WithDescription("Duration of subscriber.OnEvent processing"),
 	)
+	errs, _ := meter.Int64Counter("vinculum.messaging.errors",
+		metric.WithUnit("{error}"),
+		metric.WithDescription("Errors encountered while processing SQS messages"),
+	)
 	return &ReceiverMetrics{
 		messagesConsumed: consumed,
 		processDuration:  procDur,
+		errors:           errs,
 		baseAttrs: metric.WithAttributes(
 			attribute.String("messaging.system", "aws_sqs"),
 			attribute.String("messaging.destination.name", queueName),
@@ -56,4 +62,17 @@ func (m *ReceiverMetrics) RecordProcessDuration(ctx context.Context, d time.Dura
 		return
 	}
 	m.processDuration.Record(ctx, d.Seconds(), m.baseAttrs)
+}
+
+// RecordError increments the error counter. operation names the stage that
+// failed (e.g. "process", "settle") and errType classifies the failure
+// (e.g. "deserialize", "subscriber", "delete").
+func (m *ReceiverMetrics) RecordError(ctx context.Context, operation, errType string) {
+	if m == nil {
+		return
+	}
+	m.errors.Add(ctx, 1, m.baseAttrs, metric.WithAttributes(
+		attribute.String("messaging.operation.name", operation),
+		attribute.String("error.type", errType),
+	))
 }

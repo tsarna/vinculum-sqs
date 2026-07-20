@@ -153,6 +153,90 @@ func TestProcessMessage_CarriesInboundBaggage(t *testing.T) {
 	assert.Equal(t, "x", bg.Member("secret").Value())
 }
 
+// buildStrictReceiver returns a JSON-wire-format receiver plus a flag that
+// records whether the message was deleted.
+func buildStrictReceiver(t *testing.T, sub bus.Subscriber, hook wire.DecodeErrorHook) (*SQSReceiver, *atomic.Bool) {
+	t.Helper()
+	var deleted atomic.Bool
+	mock := &mockSQSReceive{
+		deleteFunc: func(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			deleted.Store(true)
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+	}
+	r, err := NewReceiver().
+		WithClient(mock).
+		WithQueueURL("https://sqs.us-east-1.amazonaws.com/123456789012/test-queue").
+		WithSubscriber(sub).
+		WithWireFormat(wire.JSON).
+		WithDecodeErrorHook(hook).
+		Build()
+	require.NoError(t, err)
+	return r, &deleted
+}
+
+// badJSONMessage returns an SQS message whose body is not valid JSON.
+func badJSONMessage() sqstypes.Message {
+	msgID := "msg-123"
+	receipt := "receipt-abc"
+	body := "not json {{"
+	return sqstypes.Message{MessageId: &msgID, ReceiptHandle: &receipt, Body: &body}
+}
+
+func TestProcessMessage_DecodeErrorIsFatalAndNotDelivered(t *testing.T) {
+	sub := &mockSubscriber{}
+	r, deleted := buildStrictReceiver(t, sub, nil)
+
+	r.processMessage(context.Background(), badJSONMessage())
+
+	assert.Empty(t, sub.events, "malformed message must not be delivered")
+	assert.False(t, deleted.Load(),
+		"message must not be deleted, so it redelivers after the visibility timeout")
+}
+
+func TestProcessMessage_DecodeErrorInvokesHookWithoutSuppressing(t *testing.T) {
+	sub := &mockSubscriber{}
+	var got wire.DecodeError
+	hookCalls := 0
+
+	r, deleted := buildStrictReceiver(t, sub, func(_ context.Context, e wire.DecodeError) {
+		hookCalls++
+		got = e
+	})
+
+	r.processMessage(context.Background(), badJSONMessage())
+
+	require.Equal(t, 1, hookCalls)
+	assert.Equal(t, []byte("not json {{"), got.Raw)
+	assert.Equal(t, "json", got.Format)
+	assert.Equal(t, "test-queue", got.Attrs["queue"])
+	assert.Equal(t, "msg-123", got.Attrs["message_id"])
+	require.Error(t, got.Err)
+
+	// The hook observes; it does not suppress.
+	assert.Empty(t, sub.events)
+	assert.False(t, deleted.Load())
+}
+
+func TestProcessMessage_AutoWireFormatToleratesNonJSON(t *testing.T) {
+	sub := &mockSubscriber{}
+	mock := &mockSQSReceive{}
+	r, err := NewReceiver().
+		WithClient(mock).
+		WithQueueURL("https://sqs.us-east-1.amazonaws.com/123456789012/test-queue").
+		WithSubscriber(sub).
+		WithWireFormat(wire.Auto).
+		Build()
+	require.NoError(t, err)
+
+	// "auto" is the documented migration path off the old tolerant
+	// behavior: it never fails to decode, yielding a string.
+	r.processMessage(context.Background(), badJSONMessage())
+
+	require.Len(t, sub.events, 1)
+	assert.Equal(t, "not json {{", sub.events[0].Message)
+}
+
 func TestProcessMessage_NoDeleteOnError(t *testing.T) {
 	sub := &mockSubscriber{err: errors.New("processing failed")}
 	var deleted atomic.Bool

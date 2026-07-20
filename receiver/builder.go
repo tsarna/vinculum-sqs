@@ -18,6 +18,7 @@ type ReceiverBuilder struct {
 	queueURL       string
 	subscriber     bus.Subscriber
 	wireFormat     wire.WireFormat
+	onDecodeError  wire.DecodeErrorHook
 	waitTime       int32
 	maxMessages    int32
 	visTimeout     *int32
@@ -57,6 +58,14 @@ func (b *ReceiverBuilder) WithSubscriber(s bus.Subscriber) *ReceiverBuilder {
 
 func (b *ReceiverBuilder) WithWireFormat(wf wire.WireFormat) *ReceiverBuilder {
 	b.wireFormat = wf
+	return b
+}
+
+// WithDecodeErrorHook sets an observer invoked when an inbound body fails to
+// deserialize. The hook cannot suppress the failure: the message is left
+// undeleted either way. nil (the default) means no observer.
+func (b *ReceiverBuilder) WithDecodeErrorHook(h wire.DecodeErrorHook) *ReceiverBuilder {
+	b.onDecodeError = h
 	return b
 }
 
@@ -145,6 +154,7 @@ func (b *ReceiverBuilder) Build() (*SQSReceiver, error) {
 		queueName:      queueName,
 		subscriber:     b.subscriber,
 		wireFormat:     wf,
+		onDecodeError:  b.onDecodeError,
 		waitTime:       b.waitTime,
 		maxMessages:    b.maxMessages,
 		visTimeout:     b.visTimeout,
