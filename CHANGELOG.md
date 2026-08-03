@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- The receiver's decode-error test now checks every `Attrs` key against
+  `wire.IsReservedAttr` (added in vinculum-wire v0.5.0, already required). A key that
+  collides with one of `DecodeError`'s own fields is dropped by a consumer rather than
+  allowed to shadow the fixed field, so its value is silently lost between the receiver
+  that set it and whatever reads it — which is what happened to `vinculum-mqtt`'s
+  `Attrs["topic"]`, a duplicate of `Topic` that never reached a config. This module's
+  keys (`queue`, `message_id`) are and always were clean; the check is what keeps a
+  future rename from quietly breaking one.
+
 ## [0.4.0] - 2026-07-20
 
 ### Changed
