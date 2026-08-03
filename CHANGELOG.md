@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.4.1] - 2026-08-03
+
 ### Changed
 
 - The receiver's decode-error test now checks every `Attrs` key against
