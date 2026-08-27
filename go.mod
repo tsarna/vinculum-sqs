@@ -3,7 +3,7 @@ module github.com/tsarna/vinculum-sqs
 go 1.25.8
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.43.8
+	github.com/aws/aws-sdk-go-v2 v1.44.0
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.46.8
 	github.com/stretchr/testify v1.12.1
 	github.com/tsarna/vinculum-bus v0.16.0
@@ -21,7 +21,7 @@ require (
 	github.com/apparentlymart/go-textseg/v17 v17.0.1 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.39 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.39 // indirect
-	github.com/aws/smithy-go v1.27.10 // indirect
+	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
