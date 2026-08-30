@@ -25,6 +25,7 @@ type mockSQSReceive struct {
 	receiveFunc   func(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
 	deleteFunc    func(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
 	changeVisFunc func(ctx context.Context, params *sqs.ChangeMessageVisibilityInput, optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
+	attrsFunc     func(ctx context.Context, params *sqs.GetQueueAttributesInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error)
 }
 
 func (m *mockSQSReceive) ReceiveMessage(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
@@ -46,6 +47,17 @@ func (m *mockSQSReceive) ChangeMessageVisibility(ctx context.Context, params *sq
 		return m.changeVisFunc(ctx, params, optFns...)
 	}
 	return &sqs.ChangeMessageVisibilityOutput{}, nil
+}
+
+func (m *mockSQSReceive) GetQueueAttributes(ctx context.Context, params *sqs.GetQueueAttributesInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error) {
+	if m.attrsFunc != nil {
+		return m.attrsFunc(ctx, params, optFns...)
+	}
+	return &sqs.GetQueueAttributesOutput{
+		Attributes: map[string]string{
+			string(sqstypes.QueueAttributeNameVisibilityTimeout): "30",
+		},
+	}, nil
 }
 
 // mockSubscriber captures OnEvent calls for testing.
@@ -105,13 +117,14 @@ func TestProcessMessage_BasicDispatch(t *testing.T) {
 		Body:          &body,
 	}
 
-	r.processMessage(context.Background(), msg)
+	r.processMessage(context.Background(), msg, time.Now())
 
 	events := sub.getEvents()
 	require.Len(t, events, 1)
 	assert.Equal(t, "test-queue", events[0].Topic) // default topic = queue name
 	assert.Equal(t, "msg-123", events[0].Fields["$message_id"])
-	assert.Equal(t, "receipt-abc", events[0].Fields["$receipt_handle"])
+	assert.NotContains(t, events[0].Fields, "$receipt_handle",
+		"the receipt handle is a settle token, and settling goes through the context")
 	assert.True(t, deleted.Load(), "message should be auto-deleted")
 }
 
@@ -142,7 +155,7 @@ func TestProcessMessage_CarriesInboundBaggage(t *testing.T) {
 		},
 	}
 
-	r.processMessage(context.Background(), msg)
+	r.processMessage(context.Background(), msg, time.Now())
 
 	events := sub.getEvents()
 	require.Len(t, events, 1)
@@ -187,7 +200,7 @@ func TestProcessMessage_DecodeErrorIsFatalAndNotDelivered(t *testing.T) {
 	sub := &mockSubscriber{}
 	r, deleted := buildStrictReceiver(t, sub, nil)
 
-	r.processMessage(context.Background(), badJSONMessage())
+	r.processMessage(context.Background(), badJSONMessage(), time.Now())
 
 	assert.Empty(t, sub.events, "malformed message must not be delivered")
 	assert.False(t, deleted.Load(),
@@ -204,7 +217,7 @@ func TestProcessMessage_DecodeErrorInvokesHookWithoutSuppressing(t *testing.T) {
 		got = e
 	})
 
-	r.processMessage(context.Background(), badJSONMessage())
+	r.processMessage(context.Background(), badJSONMessage(), time.Now())
 
 	require.Equal(t, 1, hookCalls)
 	assert.Equal(t, []byte("not json {{"), got.Raw)
@@ -240,7 +253,7 @@ func TestProcessMessage_AutoWireFormatToleratesNonJSON(t *testing.T) {
 
 	// "auto" is the documented migration path off the old tolerant
 	// behavior: it never fails to decode, yielding a string.
-	r.processMessage(context.Background(), badJSONMessage())
+	r.processMessage(context.Background(), badJSONMessage(), time.Now())
 
 	require.Len(t, sub.events, 1)
 	assert.Equal(t, "not json {{", sub.events[0].Message)
@@ -273,7 +286,7 @@ func TestProcessMessage_NoDeleteOnError(t *testing.T) {
 		Body:          &body,
 	}
 
-	r.processMessage(context.Background(), msg)
+	r.processMessage(context.Background(), msg, time.Now())
 	assert.False(t, deleted.Load(), "should NOT delete on OnEvent error")
 }
 
@@ -305,7 +318,7 @@ func TestProcessMessage_AutoDeleteFalse(t *testing.T) {
 		Body:          &body,
 	}
 
-	r.processMessage(context.Background(), msg)
+	r.processMessage(context.Background(), msg, time.Now())
 	assert.False(t, deleted.Load(), "should NOT delete when auto_delete=false")
 }
 
@@ -329,7 +342,7 @@ func TestProcessMessage_CustomTopicFunc(t *testing.T) {
 		Body:      &body,
 	}
 
-	r.processMessage(context.Background(), msg)
+	r.processMessage(context.Background(), msg, time.Now())
 
 	events := sub.getEvents()
 	require.Len(t, events, 1)
@@ -361,7 +374,12 @@ func TestExtractFields_SystemAttributes(t *testing.T) {
 	fields := r.extractFields(msg)
 
 	assert.Equal(t, "msg-123", fields["$message_id"])
-	assert.Equal(t, "receipt-abc", fields["$receipt_handle"])
+	// The receipt handle is deliberately absent. It has no use but deletion —
+	// an opaque, per-receive, expiring token that is meaningless to log,
+	// correlate, or compare — and the settler on the delivery's context needs
+	// no help finding it. Every other system attribute identifies the message
+	// to a human or to correlation, which is what earns a field its place.
+	assert.NotContains(t, fields, "$receipt_handle")
 	assert.Equal(t, "3", fields["$receive_count"])
 	assert.Equal(t, "1618870000000", fields["$sent_timestamp"])
 	assert.Equal(t, "1618870001000", fields["$first_receive_timestamp"])

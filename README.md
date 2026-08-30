@@ -47,13 +47,29 @@ Polls an SQS queue via long-polling and dispatches received messages to a `bus.S
 **Features:**
 - Long-polling with configurable wait time (default 20s) and max messages (default 10)
 - Automatic or manual message deletion (`auto_delete`)
+- A `bus.Settler` on every delivery's context, so anything downstream can
+  settle the message without knowing it came from SQS:
+
+  ```go
+  if s := bus.SettlerFromContext(ctx); s != nil {
+      settled, err := s.Ack(ctx)   // DeleteMessage
+  }
+  ```
+
+  `Ack` deletes; `Nack` sends nothing, leaving the message for its visibility
+  timeout and the queue's own redrive policy; `Keepalive` asks for another full
+  visibility window. A settle whose window has already lapsed is refused rather
+  than sent, because the message has gone back on the queue and may be
+  somewhere else by then — the queue's visibility timeout is read once at
+  `Start` so the receiver knows when that is.
 - Per-message vinculum topic resolution via configurable `TopicFunc`
-- SQS system attributes mapped to `$`-prefixed vinculum fields (`$message_id`, `$receipt_handle`, `$receive_count`, etc.)
+- SQS system attributes mapped to `$`-prefixed vinculum fields (`$message_id`, `$receive_count`, etc.)
 - SQS message attributes mapped back to vinculum fields with `_` to `$` reverse mapping
 - Configurable concurrency (N polling goroutines)
 - W3C trace context extraction (new root span linked to producer)
 - Exponential backoff on transient errors (1s to 30s)
-- `DeleteMsg()` and `ExtendVisibility()` methods for VCL function support
+- `DeleteMsg()` and `ExtendVisibility()` for a caller holding a receipt handle
+  it obtained some other way
 - OTel metrics instrumentation (consumed count, process duration)
 
 **Builder example:**
@@ -139,11 +155,14 @@ client "sqs_receiver" "tasks" {
 }
 ```
 
-VCL functions for manual acknowledgement:
+VCL functions for manual acknowledgement, which name neither the client nor a
+receipt handle — the delivery being settled is already on the context, so they
+work from a subscription several bus hops downstream:
 
 ```hcl
-sqs_delete(ctx, client.tasks, ctx.fields["$receipt_handle"])
-sqs_extend_visibility(ctx, client.tasks, ctx.fields["$receipt_handle"], 60)
+inbound::ack(ctx)
+inbound::nack(ctx, "could not parse it")
+inbound::keepalive(ctx)
 ```
 
 ---

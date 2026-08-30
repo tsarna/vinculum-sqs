@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -36,6 +37,13 @@ type SQSReceiveAPI interface {
 	ReceiveMessage(ctx context.Context, params *sqs.ReceiveMessageInput, optFns ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error)
 	DeleteMessage(ctx context.Context, params *sqs.DeleteMessageInput, optFns ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error)
 	ChangeMessageVisibility(ctx context.Context, params *sqs.ChangeMessageVisibilityInput, optFns ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error)
+
+	// GetQueueAttributes is asked once at Start for the queue's own visibility
+	// timeout, which the receiver needs to know when a message's receipt handle
+	// has expired. It is only consulted when the receiver does not set a
+	// visibility timeout of its own, and a failure is a warning rather than a
+	// startup error.
+	GetQueueAttributes(ctx context.Context, params *sqs.GetQueueAttributesInput, optFns ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error)
 }
 
 // TopicFunc resolves the vinculum topic for a received SQS message.
@@ -59,6 +67,12 @@ type SQSReceiver struct {
 	metrics        *ReceiverMetrics
 	logger         *zap.Logger
 	tracerProvider trace.TracerProvider
+
+	// queueVisTimeout is the queue's own visibility timeout in seconds, read
+	// once at Start when visTimeout does not override it, and zero when it
+	// could not be read. It bounds how long a message's receipt handle stays
+	// usable, so it is what tells a settle that it has arrived too late.
+	queueVisTimeout atomic.Int32
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -93,6 +107,10 @@ func (r *SQSReceiver) Start(ctx context.Context) error {
 
 	pollCtx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
+
+	// Learn how long a received message stays ours before the poll loops start,
+	// so the first message already knows when its receipt handle expires.
+	r.learnVisibilityTimeout(ctx)
 
 	n := r.concurrency
 	if n < 1 {
@@ -174,17 +192,24 @@ func (r *SQSReceiver) pollLoop(ctx context.Context) {
 		}
 		backoff = time.Second // reset on success
 
+		// A message's visibility window starts when ReceiveMessage handed it
+		// over, not when this loop gets round to it — with max_messages above
+		// one, those are not the same moment.
+		receivedAt := time.Now()
+
 		for _, msg := range result.Messages {
-			r.processMessage(ctx, msg)
+			r.processMessage(ctx, msg, receivedAt)
 		}
 	}
 }
 
 // processMessage deserializes, dispatches, and optionally deletes a
 // single SQS message.
-func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message) {
+func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message, receivedAt time.Time) {
 	// Extract message attributes → fields map.
 	fields := r.extractFields(msg)
+
+	settler := r.newSettler(msg, receivedAt)
 
 	// Extract trace context from message attributes.
 	propagator := otel.GetTextMapPropagator()
@@ -216,6 +241,13 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message) 
 	}
 	ctx, span := r.tracer().Start(ctx, "process "+r.queueName, startOpts...)
 	defer span.End()
+
+	// Acknowledgement is a property of this delivery, and `fields` cannot carry
+	// it — the bus rewrites those per subscription. The context can, and it is
+	// preserved across the async queue's goroutine hop, so putting the settler
+	// here is what lets a subscription several hops downstream settle the
+	// message it handled.
+	ctx = bus.WithSettler(ctx, settler)
 
 	if msg.MessageId != nil {
 		span.SetAttributes(attribute.String("messaging.message.id", *msg.MessageId))
@@ -280,13 +312,12 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message) 
 	r.metrics.RecordConsumed(ctx)
 	r.metrics.RecordProcessDuration(ctx, time.Since(processStart))
 
-	// Auto-delete on success.
+	// Auto-delete on success, through the same settler the subscriber would
+	// have used — so a subscriber that settled the message itself does not have
+	// it settled twice, and "vinculum deletes for you" is one policy over one
+	// mechanism rather than a second path to the queue.
 	if r.autoDelete && msg.ReceiptHandle != nil {
-		_, err := r.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
-			QueueUrl:      &r.queueURL,
-			ReceiptHandle: msg.ReceiptHandle,
-		})
-		if err != nil {
+		if _, err := settler.Ack(ctx); err != nil {
 			r.logger.Error("sqs receiver: DeleteMessage failed",
 				zap.String("queue", r.queueName),
 				zap.Error(err),
@@ -306,9 +337,13 @@ func (r *SQSReceiver) extractFields(msg sqstypes.Message) map[string]string {
 	if msg.MessageId != nil {
 		fields["$message_id"] = *msg.MessageId
 	}
-	if msg.ReceiptHandle != nil {
-		fields["$receipt_handle"] = *msg.ReceiptHandle
-	}
+	// The receipt handle is deliberately not a field. It existed only to be
+	// handed back to a manual delete, and the settler on the delivery's context
+	// needs no help finding it. As a field it would be an opaque, per-receive,
+	// expiring token that is meaningless to log, correlate, or compare, and its
+	// one obvious use would be to save it somewhere and settle later — which is
+	// storing a lease, not a value, and it expires while it sits in the
+	// variable.
 	for name, val := range msg.Attributes {
 		switch name {
 		case "ApproximateReceiveCount":
@@ -358,8 +393,13 @@ func unmapFieldName(name string) string {
 	return name
 }
 
-// DeleteMsg deletes a message by receipt handle. Called by the sqs_delete()
-// VCL function.
+// DeleteMsg deletes a message by receipt handle, for a caller holding a handle
+// it obtained some other way.
+//
+// Prefer the settler on a delivery's context, which is how a consumer of this
+// package settles what it was handed: it knows the handle without being told,
+// it settles once however many subscribers see the same delivery, and it
+// refuses a handle whose visibility window has already lapsed.
 func (r *SQSReceiver) DeleteMsg(ctx context.Context, receiptHandle string) error {
 	_, err := r.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
 		QueueUrl:      &r.queueURL,
@@ -368,8 +408,9 @@ func (r *SQSReceiver) DeleteMsg(ctx context.Context, receiptHandle string) error
 	return err
 }
 
-// ExtendVisibility changes the visibility timeout for a message. Called by
-// the sqs_extend_visibility() VCL function.
+// ExtendVisibility changes the visibility timeout for a message. It is what
+// the settler's Keepalive issues, and is exported for a caller holding a
+// receipt handle it obtained some other way.
 func (r *SQSReceiver) ExtendVisibility(ctx context.Context, receiptHandle string, timeoutSeconds int32) error {
 	_, err := r.client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
 		QueueUrl:          &r.queueURL,

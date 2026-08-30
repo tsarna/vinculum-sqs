@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+## [0.5.0] - 2026-08-30
+
+### Added
+
+- **Every delivery carries a settler.** Acknowledgement is a property of the
+  delivery, not of the payload and not of the subscriber that handles it, and
+  `fields` cannot carry it — the bus rewrites those per subscription. So the
+  receiver now puts a `bus.Settler` (vinculum-bus v0.18.0) on the context it
+  delivers with, and anything downstream — past transforms, an async queue, and
+  any number of bus hops — can settle the message without knowing it came from
+  SQS:
+
+  ```go
+  if s := bus.SettlerFromContext(ctx); s != nil {
+      settled, err := s.Ack(ctx)
+  }
+  ```
+
+  `Ack` is `DeleteMessage`. `Nack` sends nothing: an SQS message is
+  not-acknowledged by simply not being deleted, and the queue's own redrive
+  policy decides when it has been tried enough — the receiver's configured
+  policy, deliberately not the caller's choice. Returning it immediately with a
+  zero visibility timeout was considered and rejected, because it turns a
+  configuration that nacks into a redelivery loop running as fast as the queue
+  can serve it; the receive count advances either way, so only the delay would
+  differ. The reason is logged, which on SQS is the only place it can go.
+  `Keepalive` asks for another full visibility window.
+
+- **A settle whose visibility window has lapsed is refused rather than sent**,
+  with a `*StaleError` saying so. Past its window the message is back on the
+  queue and may already be somewhere else, so deleting on that handle settles
+  work being done again elsewhere.
+
+- **The queue's visibility timeout is read once at `Start`**, which is what
+  makes the check above possible when the receiver does not set a timeout of its
+  own. This adds `GetQueueAttributes` to `SQSReceiveAPI` — a breaking change for
+  anyone implementing that interface, in practice a test fake. A queue policy
+  that withholds the call does not stop the receiver starting: it logs one
+  warning and runs exactly as before, with staleness undetectable and
+  `Keepalive` reporting that it extended nothing rather than asking for a window
+  length it invented (a guess that is too short would cut the lease rather than
+  extend it).
+
+### Changed
+
+- **`auto_delete = true` settles through that same settler**, so a subscriber
+  that deleted the message itself does not have it deleted twice. Automatic
+  deletion is now one policy over one mechanism rather than a second path to the
+  queue. Behaviour is otherwise unchanged: the message is still deleted after
+  delivery returns without error, and only then.
+- `DeleteMsg` and `ExtendVisibility` remain, for a caller holding a receipt
+  handle it obtained some other way; `ExtendVisibility` is what `Keepalive`
+  issues.
+
+### Removed
+
+- **`$receipt_handle` is no longer a delivered field.** It existed only to be
+  handed back to a manual delete, and the settler needs no help finding it. As a
+  field it is an opaque, per-receive, expiring token that is meaningless to log,
+  correlate, or compare, and its one obvious use would be to save it somewhere
+  and settle later — which is storing a lease rather than a value, and it
+  expires while it sits in the variable. Every other `$` system attribute stays:
+  each identifies the message to a human or to correlation, which is what earns
+  a field its place.
+
 ## [0.4.1] - 2026-08-03
 
 ### Changed
