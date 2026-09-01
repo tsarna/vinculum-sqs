@@ -4,7 +4,7 @@ go 1.25.8
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.45.1
-	github.com/aws/aws-sdk-go-v2/service/sqs v1.48.1
+	github.com/aws/aws-sdk-go-v2/service/sqs v1.50.0
 	github.com/stretchr/testify v1.12.1
 	github.com/tsarna/vinculum-bus v0.18.0
 	github.com/tsarna/vinculum-wire v0.5.0
