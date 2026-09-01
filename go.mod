@@ -6,7 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.45.1
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.50.0
 	github.com/stretchr/testify v1.12.1
-	github.com/tsarna/vinculum-bus v0.18.0
+	github.com/tsarna/vinculum-bus v0.19.0
 	github.com/tsarna/vinculum-wire v0.5.0
 	github.com/zclconf/go-cty v1.19.0
 	go.opentelemetry.io/otel v1.46.0
@@ -25,6 +25,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/tsarna/go-structdiff v0.2.1 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect

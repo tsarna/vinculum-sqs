@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.6.0] - 2026-09-01
+
 ### Changed
 
 - **`auto_delete` deletes when the work finishes, not when delivery returns.**
