@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Changed
+
+- **`auto_delete` deletes when the work finishes, not when delivery returns.**
+  The two are the same thing only while delivery is synchronous. Put an async
+  queue, a bus hop, or a state machine downstream and delivery returns the
+  moment the message is *enqueued* — so the message was deleted before anything
+  had handled it, and a handler that then failed had nothing left to redeliver.
+
+  The receiver now marks its settler as framework-settled and lets whatever
+  finishes the work settle it, however many hops away that happens. This makes
+  `queue_size` alongside automatic deletion correct, where before it was a way
+  to lose messages.
+
+  A failed handler nacks, which on SQS means leaving the message to become
+  visible again when its visibility timeout lapses — what used to happen
+  implicitly, now as a decision the settler records.
+
+  A message with no receipt handle cannot be deleted at all, so it is never
+  marked framework-settled: promising an acknowledgement this receiver cannot
+  deliver would leave a delivery that nothing will ever settle.
+
 ## [0.5.0] - 2026-08-30
 
 ### Added

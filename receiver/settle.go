@@ -94,6 +94,14 @@ func (o *messageSettleOps) Valid() (bool, string) {
 
 // newSettler returns the settler for one received message. receivedAt is when
 // ReceiveMessage returned it, which is when its visibility window started.
+//
+// Under auto_delete the settler is marked as settled by the framework, which is
+// the same boolean this receiver has always carried and a different thing to do
+// with it. It used to mean "delete once delivery returns", which is exact only
+// while delivery is synchronous — a queue or a bus hop downstream returns as
+// soon as the message is enqueued. Now it means "whoever finishes the work
+// settles this", and the deletion follows the work however many hops away it
+// happens.
 func (r *SQSReceiver) newSettler(msg sqstypes.Message, receivedAt time.Time) bus.Settler {
 	ops := &messageSettleOps{receiver: r}
 	if msg.ReceiptHandle != nil {
@@ -104,6 +112,12 @@ func (r *SQSReceiver) newSettler(msg sqstypes.Message, receivedAt time.Time) bus
 	}
 	if secs := r.visibilityTimeout(); secs > 0 {
 		ops.deadline = receivedAt.Add(time.Duration(secs) * time.Second)
+	}
+
+	// A message with no receipt handle cannot be deleted at all, so marking it
+	// framework-settled would promise something this receiver cannot keep.
+	if r.autoDelete && msg.ReceiptHandle != nil {
+		return bus.NewSettler(ops, bus.AutoSettle())
 	}
 	return bus.NewSettler(ops)
 }

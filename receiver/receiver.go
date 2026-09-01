@@ -296,7 +296,20 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message, 
 
 	// Dispatch to subscriber.
 	processStart := time.Now()
-	if err := r.subscriber.OnEvent(ctx, topic, payload, fields); err != nil {
+	err := r.subscriber.OnEvent(ctx, topic, payload, fields)
+
+	// The settle point. Under auto_delete this deletes a subscriber that
+	// handled the message and leaves one that only queued it to settle at its
+	// own completion; under manual it does nothing but report a failure,
+	// because the configuration asked for the decision.
+	//
+	// It runs through the same settler a subscriber would have used, so a
+	// subscriber that settled the message itself does not have it settled
+	// twice: "vinculum deletes for you" is one policy over one mechanism
+	// rather than a second path to the queue.
+	bus.SettleOnReturn(ctx, r.subscriber, err)
+
+	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 		r.logger.Error("sqs receiver: subscriber.OnEvent failed",
@@ -305,27 +318,13 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message, 
 			zap.Error(err),
 		)
 		r.metrics.RecordError(ctx, "process", "subscriber")
-		// Do NOT delete — message returns to queue after visibility timeout.
+		// Not deleted — the message returns to the queue after its visibility
+		// timeout, which is what a nack means on SQS.
 		return
 	}
 
 	r.metrics.RecordConsumed(ctx)
 	r.metrics.RecordProcessDuration(ctx, time.Since(processStart))
-
-	// Auto-delete on success, through the same settler the subscriber would
-	// have used — so a subscriber that settled the message itself does not have
-	// it settled twice, and "vinculum deletes for you" is one policy over one
-	// mechanism rather than a second path to the queue.
-	if r.autoDelete && msg.ReceiptHandle != nil {
-		if _, err := settler.Ack(ctx); err != nil {
-			r.logger.Error("sqs receiver: DeleteMessage failed",
-				zap.String("queue", r.queueName),
-				zap.Error(err),
-			)
-			r.metrics.RecordError(ctx, "settle", "delete")
-			// Message will be redelivered after visibility timeout — at-least-once.
-		}
-	}
 }
 
 // extractFields builds the vinculum fields map from SQS message
