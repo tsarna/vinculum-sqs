@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Added
+
+- **`Drain`, so a receiver can stop reading without stopping.** Stopping used
+  to be one action: cancel everything and shut down. That is the wrong shape
+  for a graceful shutdown, where a process wants to stop *accepting* messages
+  long before it stops being able to delete them.
+
+  `Drain(ctx)` ends every poll loop and waits for the messages in hand to
+  finish delivering. Everything else is left alone: settlers already handed out
+  stay valid, and a message still travelling through a queue downstream deletes
+  normally when it lands. `Stop` then closes up afterwards, with nothing left
+  owed. The wait is bounded by the caller's context, because what it waits for
+  is user-supplied work.
+
+- **`Unsettled`, the count of deliveries nothing has settled yet.** Not the
+  broker's in-flight count: a message whose visibility timeout is running down
+  after a nack is SQS's business, and nothing here is going to delete it. This
+  is the narrower number a shutdown can usefully wait for. A message that
+  arrived without a receipt handle can never be settled at all, so it is never
+  counted rather than counted and released.
+
+### Changed
+
+- **`Stop` no longer waits without a bound after a drain that timed out.** The
+  drain has already given that delivery a bounded chance to finish and it did
+  not take it; waiting again, with no bound and nothing to interrupt it, would
+  let one stuck action stop the process from exiting. `Stop` cancels and reports
+  instead. Whether the delivery is *still* running is checked when `Stop` asks
+  rather than remembered from the drain, since a whole shutdown phase separates
+  the two and the answer usually changes in between.
+
+- **`Start` refuses to restart a receiver whose previous delivery is still
+  running**, rather than starting a second set of pollers over the top of it.
+
 ## [0.6.0] - 2026-09-01
 
 ### Changed

@@ -74,9 +74,58 @@ type SQSReceiver struct {
 	// usable, so it is what tells a settle that it has arrived too late.
 	queueVisTimeout atomic.Int32
 
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	// Two cancels, because stopping is two things and a graceful shutdown wants
+	// them apart. stopRead ends the poll loops and nothing else; stopWork
+	// cancels the context every delivery and every settle rides on, and so is
+	// the one that ends the receiver. stopRead's context is derived from
+	// stopWork's, so cancelling work ends polling too.
+	mu       sync.Mutex
+	stopRead context.CancelFunc
+	stopWork context.CancelFunc
+	wg       sync.WaitGroup
+
+	// unsettled counts deliveries handed out and not yet deleted, nacked, or
+	// abandoned. See Unsettled.
+	unsettled atomic.Int64
+
+	// stillDelivering is the channel a timed-out Drain was waiting on, closed
+	// when the loops finally finish. Nil until the first drain, and set by
+	// every drain rather than only by one that gives up — what makes it answer
+	// "no" is the channel being closed, not the field being absent.
+	//
+	// A channel rather than a flag because the question is asked a phase later
+	// and the answer moves in between: teardown runs a whole quiesce between
+	// Drain and Stop, so a delivery that overran the drain's deadline by a
+	// moment has very likely finished by the time Stop looks. A flag would say
+	// otherwise and put an error in the log of a shutdown where nothing went
+	// wrong. See stillRunning.
+	stillDelivering atomic.Pointer[chan struct{}]
+}
+
+// Unsettled reports how many deliveries this receiver has handed out that
+// nothing has settled yet.
+//
+// It is not the number of messages in flight at the queue. A message left
+// undeleted by a nack, or by a delivery that failed before reaching the
+// subscriber, is SQS's business — the visibility timeout and the queue's own
+// redrive policy decide what becomes of it — and nothing in this process is
+// going to delete it. What this counts is the narrower thing a shutdown can
+// usefully wait for: settles that are still coming.
+func (r *SQSReceiver) Unsettled() int { return int(r.unsettled.Load()) }
+
+// stillRunning reports whether a delivery a drain gave up on is running *now*,
+// rather than whether one ever was.
+func (r *SQSReceiver) stillRunning() bool {
+	ch := r.stillDelivering.Load()
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-*ch:
+		return false
+	default:
+		return true
+	}
 }
 
 func (r *SQSReceiver) tracer() trace.Tracer {
@@ -101,12 +150,31 @@ func (r *SQSReceiver) Start(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.cancel != nil {
-		return fmt.Errorf("sqs receiver %s: already started", r.queueName)
+	if r.stopWork != nil {
+		return fmt.Errorf("sqs receiver %q: already started", r.queueName)
 	}
 
-	pollCtx, cancel := context.WithCancel(context.Background())
-	r.cancel = cancel
+	// A loop from the last cycle still owns the WaitGroup. A Stop that gave up
+	// on a delivery returns without waiting, so that goroutine never reached its
+	// Done — and starting more over the top of it would leave the counter high,
+	// with this cycle's Stop blocking forever on the abandoned part of it. That
+	// is the unbounded wait Drain's bound exists to remove, one cycle later and
+	// with nothing left to report it. Checked before the clear below, which
+	// would otherwise erase the evidence.
+	if r.stillRunning() {
+		return fmt.Errorf("sqs receiver %q: a previous delivery is still running", r.queueName)
+	}
+
+	workCtx, stopWork := context.WithCancel(context.Background())
+	readCtx, stopRead := context.WithCancel(workCtx)
+	r.stopWork = stopWork
+	r.stopRead = stopRead
+
+	// stillDelivering is deliberately left as it is. The guard above has already
+	// established that it is nil or closed, and a closed channel answers
+	// stillRunning the same way nil does — until this cycle's own Drain
+	// replaces it. Clearing it here would look like the load-bearing step and
+	// would not be one.
 
 	// Learn how long a received message stays ours before the poll loops start,
 	// so the first message already knows when its receipt handle expires.
@@ -119,7 +187,7 @@ func (r *SQSReceiver) Start(ctx context.Context) error {
 
 	for i := 0; i < n; i++ {
 		r.wg.Add(1)
-		go r.pollLoop(pollCtx)
+		go r.pollLoop(readCtx, workCtx)
 	}
 
 	r.logger.Info("sqs receiver started",
@@ -130,16 +198,103 @@ func (r *SQSReceiver) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop signals the polling loop(s) to drain and exit, then waits for
-// all goroutines to finish.
-func (r *SQSReceiver) Stop(ctx context.Context) error {
+// Drain stops polling for new messages and waits for the loops to finish the
+// batches they are holding. It leaves everything else alone: the SQS client
+// stays usable, and the settlers already handed out stay valid, so a message
+// still travelling through a queue downstream is deleted normally when the work
+// lands.
+//
+// That is the whole difference between draining and stopping, and it is what
+// lets a shutdown stop consuming first and disconnect last. Between the two, a
+// process is finishing work it has already accepted and taking on none.
+//
+// Every poll loop drains at once, under the one deadline. They stop reading
+// independently, and what is being waited for is delivery — one loop's slow
+// action is no reason to cut another's short.
+//
+// Bounded by ctx, which the caller sizes: delivery runs user-supplied work.
+//
+// Safe to call before Start, after Stop, or twice — though a second call after
+// one that timed out reports the timeout again rather than a clean drain, since
+// the delivery it gave up on is still running.
+func (r *SQSReceiver) Drain(ctx context.Context) error {
 	r.mu.Lock()
-	cancel := r.cancel
-	r.cancel = nil
+	stopRead := r.stopRead
+	if stopRead == nil {
+		r.mu.Unlock()
+		if r.stillRunning() {
+			return fmt.Errorf("sqs receiver %q: still delivering", r.queueName)
+		}
+		return nil
+	}
+	r.stopRead = nil
+	stopRead()
+
+	done := make(chan struct{})
+	go func() {
+		r.wg.Wait()
+		close(done)
+	}()
+
+	// Published before the wait, not only when the wait gives up: the waiter
+	// outlives this call either way, and while it is open it is the honest
+	// answer to "are the loops still delivering" — which is what a later phase
+	// asks.
+	//
+	// Published under the same lock that cleared stopRead, because the two
+	// together are what a concurrent second Drain reads. Between them it would
+	// see the field already taken and no waiter yet, and report a clean drain
+	// that has not happened — which is the whole defect this is here to
+	// prevent, surviving in the gap. Nothing under this lock does I/O.
+	r.stillDelivering.Store(&done)
 	r.mu.Unlock()
 
-	if cancel != nil {
-		cancel()
+	select {
+	case <-done:
+		r.logger.Info("sqs receiver drained", zap.String("queue", r.queueName))
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("sqs receiver %q: drain: %w", r.queueName, ctx.Err())
+	}
+}
+
+// Stop ends the receiver: polling stops if it has not already, and the context
+// every in-flight delivery and every outstanding settle rides on is cancelled.
+// A deletion attempted after this has nowhere to go, which is why a graceful
+// shutdown drains first and gets here only once the pipeline is empty.
+//
+// It waits for the loops, so a delivery still running finishes and settles
+// normally — with one exception. A Drain that timed out has already given that
+// delivery a bounded chance to finish, and it did not take it; waiting here
+// would hand the same expression a second wait with no bound at all, and this
+// time nothing would interrupt it. So Stop cancels and reports rather than
+// blocking, because the one thing a stuck action must never be able to do is
+// stop the process from exiting.
+//
+// Whether it is *still* running is checked here rather than remembered from the
+// drain. A whole phase separates the two, and a delivery that overran the
+// drain's deadline by a moment has usually finished by now — reporting one that
+// has not, when it has, is an error in the log of a shutdown that went fine.
+//
+// Repeated calls repeat the answer, as Drain's do, so a caller that stops twice
+// is not told the second time that everything was well. A receiver stopped this
+// way cannot be started again until that delivery finishes, because the
+// goroutine still owns the loops' WaitGroup; Start says so.
+func (r *SQSReceiver) Stop(ctx context.Context) error {
+	r.mu.Lock()
+	stopWork := r.stopWork
+	r.stopRead, r.stopWork = nil, nil
+	r.mu.Unlock()
+
+	if stopWork == nil {
+		return r.stoppedWithDeliveryRunning()
+	}
+	// Cancelling work cancels polling with it: the read context is derived from
+	// this one, so a Stop that was not preceded by a Drain still ends the loops.
+	stopWork()
+
+	if err := r.stoppedWithDeliveryRunning(); err != nil {
+		return err
 	}
 	r.wg.Wait()
 
@@ -147,14 +302,33 @@ func (r *SQSReceiver) Stop(ctx context.Context) error {
 	return nil
 }
 
+func (r *SQSReceiver) stoppedWithDeliveryRunning() error {
+	if !r.stillRunning() {
+		return nil
+	}
+	return fmt.Errorf("sqs receiver %q: stopped with a delivery still running", r.queueName)
+}
+
 // pollLoop is the per-goroutine receive/process/delete loop.
-func (r *SQSReceiver) pollLoop(ctx context.Context) {
+//
+// The two contexts are the same lifetime until a drain separates them. readCtx
+// bounds the ReceiveMessage call and decides when the loop exits; workCtx is
+// what every delivery and every settle runs on, and outlives readCtx by the
+// length of the shutdown. Passing readCtx to a delivery would mean draining
+// cancelled the work it was waiting for, and cancelled the deletion it was
+// waiting for the work to produce.
+//
+// The batch in hand is finished either way: the exit check is at the top of the
+// loop, so a drain that lands mid-batch delivers the rest of it and then stops.
+// With max_messages above one that is up to ten messages, which is the whole
+// reason it is worth finishing rather than abandoning.
+func (r *SQSReceiver) pollLoop(readCtx, workCtx context.Context) {
 	defer r.wg.Done()
 
 	backoff := time.Second
 
 	for {
-		if ctx.Err() != nil {
+		if readCtx.Err() != nil {
 			return
 		}
 
@@ -171,9 +345,9 @@ func (r *SQSReceiver) pollLoop(ctx context.Context) {
 			input.VisibilityTimeout = *r.visTimeout
 		}
 
-		result, err := r.client.ReceiveMessage(ctx, input)
+		result, err := r.client.ReceiveMessage(readCtx, input)
 		if err != nil {
-			if ctx.Err() != nil {
+			if readCtx.Err() != nil {
 				return // normal shutdown
 			}
 			r.logger.Error("sqs receiver: ReceiveMessage failed",
@@ -181,7 +355,7 @@ func (r *SQSReceiver) pollLoop(ctx context.Context) {
 				zap.Error(err),
 			)
 			select {
-			case <-ctx.Done():
+			case <-readCtx.Done():
 				return
 			case <-time.After(backoff):
 			}
@@ -198,7 +372,7 @@ func (r *SQSReceiver) pollLoop(ctx context.Context) {
 		receivedAt := time.Now()
 
 		for _, msg := range result.Messages {
-			r.processMessage(ctx, msg, receivedAt)
+			r.processMessage(workCtx, msg, receivedAt)
 		}
 	}
 }
@@ -209,7 +383,7 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message, 
 	// Extract message attributes → fields map.
 	fields := r.extractFields(msg)
 
-	settler := r.newSettler(msg, receivedAt)
+	settler, ops := r.newSettler(msg, receivedAt)
 
 	// Extract trace context from message attributes.
 	propagator := otel.GetTextMapPropagator()
@@ -287,6 +461,11 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message, 
 					Attrs:  attrs,
 				})
 			}
+			// Released, not settled. The message stays in flight at the queue —
+			// that is the policy above, and the redrive policy's business — but
+			// no delete is ever coming for it, so a shutdown has nothing to
+			// wait for.
+			ops.release()
 			return
 		}
 	}
@@ -308,6 +487,16 @@ func (r *SQSReceiver) processMessage(ctx context.Context, msg sqstypes.Message, 
 	// twice: "vinculum deletes for you" is one policy over one mechanism
 	// rather than a second path to the queue.
 	bus.SettleOnReturn(ctx, r.subscriber, err)
+
+	// An observing subscriber settles nothing and defers to nobody — it saw the
+	// message go past. SettleOnReturn returns without acting, so no settle is
+	// coming from anywhere and this delivery has to be released by hand or the
+	// count never comes back down. It is the third of the three paths through
+	// here that reach no settler; the other two are the decode failure above
+	// and a message with no receipt handle, which is never counted at all.
+	if bus.DispositionOf(r.subscriber) == bus.Observed {
+		ops.release()
+	}
 
 	if err != nil {
 		span.RecordError(err)
