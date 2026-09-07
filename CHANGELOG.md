@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.7.0] - 2026-09-06
+
 ### Added
 
 - **`Drain`, so a receiver can stop reading without stopping.** Stopping used
